@@ -193,6 +193,26 @@ release_channel_pollers() {
   stop_pidfile "$COORD_PIDFILE" "channel-coordinator"
 }
 
+# running_channel_provider -- echo the provider the live channels session is
+# actually bound to, read from the `--channels plugin:<provider>` argument of the
+# claude process in the ${SLUG}-channels tmux session. Empty if it can't be
+# determined (no tmux, session not up). Uses ps (portable across Linux/macOS),
+# not /proc.
+running_channel_provider() {
+  command -v tmux >/dev/null 2>&1 || return 0
+  local sess="${SLUG}-channels" pane_pid p cmd
+  pane_pid="$(tmux list-panes -t "$sess" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  [ -n "$pane_pid" ] || return 0
+  for p in "$pane_pid" $(pgrep -P "$pane_pid" 2>/dev/null); do
+    cmd="$(ps -o command= -p "$p" 2>/dev/null)"
+    case "$cmd" in
+      *"--channels plugin:"*)
+        echo "$cmd" | grep -oE -- '--channels plugin:[a-z]+' | grep -oE '[a-z]+$'
+        return 0 ;;
+    esac
+  done
+}
+
 # safe_rm PATH -- remove a path with guard rails: refuses empty, "/", $HOME, the
 # install dir, and anything outside $HOME / $INSTALL_DIR. Honors DRY_RUN.
 safe_rm() {
