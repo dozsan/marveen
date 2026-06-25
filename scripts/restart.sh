@@ -148,11 +148,30 @@ restart_pidfile() {
   post_restart_channel_check || true
 }
 
-# ── channel rebind verification hook (card 8f1886d3) ─────────────────────────
-# Verify the freshly restarted channels session bound the CURRENT provider
-# (e.g. Telegram) and is not stuck on a stale Discord connection. No-op for now.
+# ── channel rebind verification (card 8f1886d3) ──────────────────────────────
+# Verify the freshly restarted channels session bound the CURRENT provider (from
+# .env) and is not stuck on a stale one (e.g. Discord after a switch to Telegram).
+# Advisory: callers invoke it with `|| true`, so a mismatch warns but does not
+# fail the restart. The provider is read at channels.sh startup, hence the check.
 post_restart_channel_check() {
-  return 0
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "  - would verify channel provider rebind (dry-run)"
+    return 0
+  fi
+  local expected="$CHANNEL_PROVIDER" actual
+  sleep 2   # give the relaunched session a moment to bind
+  actual="$(running_channel_provider)"
+  if [ -z "$actual" ]; then
+    echo "  ! channel rebind: running provider undetermined (session not up yet?)" >&2
+    return 0
+  fi
+  if [ "$actual" = "$expected" ]; then
+    echo "  ✓ channel rebind: bound to ${actual} (matches .env)"
+    return 0
+  fi
+  echo "  ✗ channel rebind: bound to ${actual} but .env says ${expected} -- stale provider" >&2
+  echo "    note: the dashboard caches CHANNEL_PROVIDER at startup; restart it too if it respawns the wrong one" >&2
+  return 1
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
