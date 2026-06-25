@@ -34,8 +34,16 @@ fi
 SLUG="${SLUG:-marveen}"
 CHANNEL_PROVIDER="${CHANNEL_PROVIDER:-telegram}"
 BOT_NAME="${BOT_NAME:-Marveen}"
-
 DRY_RUN=0
+
+# Platform service layer (platform_detect, svc_*, stop_pidfile,
+# release_channel_pollers, safe_rm, SYSTEMD_DIR / LAUNCHD_DIR). Sourced after the
+# identity vars so the lib picks up SLUG / CHANNEL_PROVIDER / INSTALL_DIR.
+# shellcheck source=lib/platform.sh
+source "$INSTALL_DIR/scripts/lib/platform.sh"
+
+CLAUDE_DIR="$HOME/.claude"
+
 PURGE=0
 ASSUME_YES=0
 for arg in "$@"; do
@@ -47,30 +55,6 @@ for arg in "$@"; do
     *) echo "Unknown argument: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
-
-SYSTEMD_DIR="$HOME/.config/systemd/user"
-CLAUDE_DIR="$HOME/.claude"
-
-# Guard against ever rm -rf'ing a dangerous path. Every removal goes through
-# this: it refuses empty, "/", $HOME and the install dir itself, and only acts
-# on paths under $HOME or $INSTALL_DIR.
-safe_rm() {
-  local path="$1"
-  [ -e "$path" ] || [ -L "$path" ] || return 0
-  case "$path" in
-    ""|"/"|"$HOME"|"$HOME/"|"$INSTALL_DIR"|"$INSTALL_DIR/")
-      echo "  ✗ refusing to remove protected path: $path" >&2; return 1 ;;
-  esac
-  case "$path" in
-    "$HOME"/*|"$INSTALL_DIR"/*) : ;;
-    *) echo "  ✗ refusing to remove out-of-scope path: $path" >&2; return 1 ;;
-  esac
-  if [ "$DRY_RUN" = "1" ]; then
-    echo "  - would remove: $path"
-  else
-    rm -rf "$path" && echo "  ✓ removed: $path"
-  fi
-}
 
 # ── confirmation ─────────────────────────────────────────────────────────────
 echo "${BOT_NAME} uninstall (SLUG=${SLUG}, provider=${CHANNEL_PROVIDER})"
@@ -88,52 +72,38 @@ fi
 
 # ── 1. stop + remove services ────────────────────────────────────────────────
 echo "Stopping services..."
-OS="$(uname -s)"
-if [ "$OS" = "Darwin" ]; then
-  for unit in dashboard channels channel-coordinator; do
-    plist="$HOME/Library/LaunchAgents/com.${SLUG}.${unit}.plist"
-    [ "$unit" = "channel-coordinator" ] && plist="$HOME/Library/LaunchAgents/com.marveen.channel-coordinator.plist"
-    if [ -e "$plist" ]; then
-      [ "$DRY_RUN" = "1" ] || launchctl unload "$plist" 2>/dev/null || true
-      safe_rm "$plist"
-    fi
-  done
-else
-  UNITS=("${SLUG}-dashboard.service" "${SLUG}-channels.service" "${SLUG}-morning.service" "${SLUG}-morning.timer")
-  if pidof systemd >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
-    for unit in "${UNITS[@]}"; do
-      if systemctl --user cat "$unit" >/dev/null 2>&1; then
-        if [ "$DRY_RUN" = "1" ]; then
-          echo "  - would stop/disable: $unit"
-        else
-          systemctl --user stop "$unit" 2>/dev/null || true
-          systemctl --user disable "$unit" 2>/dev/null || true
-          echo "  ✓ stopped/disabled: $unit"
-        fi
-      fi
-    done
+PLATFORM="$(platform_detect)"
+
+# Stop, disable and remove each logical service via the platform layer. svc_*
+# are no-ops for services absent on the active platform (e.g. morning on macOS).
+for logical in dashboard channels morning; do
+  svc_stop "$logical"
+  svc_disable "$logical"
+  svc_remove "$logical"
+done
+
+# Platform-specific companions the logical verbs don't cover:
+if [ "$PLATFORM" = "linux-systemd" ]; then
+  # 'morning' maps to the .timer; its oneshot companion .service needs removing too.
+  [ "$DRY_RUN" = "1" ] || systemctl --user stop "${SLUG}-morning.service" 2>/dev/null || true
+  safe_rm "$SYSTEMD_DIR/${SLUG}-morning.service"
+  svc_daemon_reload
+elif [ "$PLATFORM" = "macos" ]; then
+  # The channel-coordinator LaunchAgent (no logical service mapping).
+  coord_plist="$LAUNCHD_DIR/com.marveen.channel-coordinator.plist"
+  if [ -e "$coord_plist" ]; then
+    [ "$DRY_RUN" = "1" ] || launchctl unload "$coord_plist" 2>/dev/null || true
+    safe_rm "$coord_plist"
   fi
-  for unit in "${UNITS[@]}"; do
-    safe_rm "$SYSTEMD_DIR/$unit"
-  done
-  [ "$DRY_RUN" = "1" ] || systemctl --user daemon-reload 2>/dev/null || true
 fi
 
-# Tear down the channels tmux session and any pidfile-backed fallback processes.
-if [ "$DRY_RUN" != "1" ]; then
-  tmux kill-session -t "${SLUG}-channels" 2>/dev/null || true
-fi
-for svc in dashboard channels; do
-  pidfile="$INSTALL_DIR/store/${svc}.pid"
-  if [ -f "$pidfile" ]; then
-    if [ "$DRY_RUN" = "1" ]; then
-      echo "  - would stop pidfile process: $pidfile"
-    else
-      kill "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
-      rm -f "$pidfile"
-    fi
-  fi
-done
+# Tear down the channels tmux session, any leftover pidfile-backed processes,
+# and the channel pollers (bot.pid / coordinator.pid) before the channel state
+# dir is removed below.
+[ "$DRY_RUN" = "1" ] || tmux kill-session -t "${SLUG}-channels" 2>/dev/null || true
+stop_pidfile "$INSTALL_DIR/store/dashboard.pid" dashboard
+stop_pidfile "$INSTALL_DIR/store/channels.pid" channels
+release_channel_pollers
 
 # ── 2. channel state + secrets ───────────────────────────────────────────────
 echo "Removing channel state and secrets..."
