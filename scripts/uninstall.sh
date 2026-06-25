@@ -19,7 +19,8 @@
 #   uninstall.sh              remove services + seeded content (keeps your data)
 #   uninstall.sh --purge      ALSO remove store/, agents/, node_modules, dist
 #   uninstall.sh --dry-run    print what would be removed, change nothing
-#   uninstall.sh --yes        skip the interactive confirmation
+#   uninstall.sh --yes        skip the routine confirmation (NOT the purge gate)
+#   uninstall.sh --force      skip the --purge data-deletion gate too (for CI)
 #
 set -uo pipefail
 
@@ -46,12 +47,14 @@ CLAUDE_DIR="$HOME/.claude"
 
 PURGE=0
 ASSUME_YES=0
+FORCE=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --purge)   PURGE=1 ;;
     --yes|-y)  ASSUME_YES=1 ;;
-    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+    --force)   FORCE=1 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "Unknown argument: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -59,15 +62,26 @@ done
 # ── confirmation ─────────────────────────────────────────────────────────────
 echo "${BOT_NAME} uninstall (SLUG=${SLUG}, provider=${CHANNEL_PROVIDER})"
 echo "  install dir: $INSTALL_DIR"
-[ "$PURGE" = "1" ] && echo "  --purge: WILL ALSO DELETE store/ (memory+kanban DB) and agents/"
+[ "$PURGE" = "1" ] && echo "  --purge: WILL ALSO DELETE store/ (memory+kanban DB) and agents/ (the whole fleet)"
 [ "$DRY_RUN" = "1" ] && echo "  --dry-run: no changes will be made"
-if [ "$DRY_RUN" != "1" ] && [ "$ASSUME_YES" != "1" ]; then
+if [ "$DRY_RUN" != "1" ] && [ "$ASSUME_YES" != "1" ] && [ "$FORCE" != "1" ]; then
   printf "Proceed? [y/N] "
   read -r reply
   case "$reply" in
     y|Y|yes|YES) : ;;
     *) echo "Aborted."; exit 0 ;;
   esac
+fi
+# Second, irreversible-data gate for --purge. Deliberately NOT skipped by --yes
+# (which only covers the routine uninstall); only --force bypasses it, for CI.
+# Without a typed DELETE we downgrade to a normal uninstall and keep the data.
+if [ "$PURGE" = "1" ] && [ "$DRY_RUN" != "1" ] && [ "$FORCE" != "1" ]; then
+  printf "  --purge deletes store/ + agents/ irreversibly. Type DELETE to confirm: "
+  read -r purge_reply
+  if [ "$purge_reply" != "DELETE" ]; then
+    echo "  purge not confirmed -- keeping store/ and agents/ (proceeding with normal uninstall)."
+    PURGE=0
+  fi
 fi
 
 # ── 1. stop + remove services ────────────────────────────────────────────────

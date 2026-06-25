@@ -124,6 +124,11 @@ restart_supervised() {
   if [ "${#TARGETS[@]}" -gt 0 ]; then list=("${TARGETS[@]}"); else list=("dashboard" "channels"); fi
 
   echo "${BOT_NAME}: restarting services..."
+  # Free any wedged channel pollers BEFORE restarting channels, so the fresh
+  # session binds the current provider. f1fc9501's teardown thus runs on the
+  # supervised (systemd/launchd) path too, not only the pidfile fallback --
+  # which is what the --list inventory promises.
+  case " ${list[*]} " in *" channels "*) release_channel_pollers ;; esac
   for logical in "${list[@]}"; do
     restart_service "$logical" || rc=1
   done
