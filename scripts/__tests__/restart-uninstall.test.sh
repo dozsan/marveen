@@ -145,7 +145,9 @@ if bash "$UNI" --yes >/dev/null 2>&1; then pass "second uninstall run is idempot
 # ===========================================================================
 echo ""; echo "(5) uninstall.sh --purge removes data"
 make_install
-bash "$INSTALL_DIR/scripts/uninstall.sh" --purge --yes >/dev/null 2>&1
+# Feed DELETE on stdin: harmless if the build has no purge gate, and satisfies
+# it if it does -- keeps this test correct across the gate's introduction.
+printf 'DELETE\n' | bash "$INSTALL_DIR/scripts/uninstall.sh" --purge --yes >/dev/null 2>&1
 assert_gone "purge removes store/"  "$INSTALL_DIR/store"
 assert_gone "purge removes agents/" "$INSTALL_DIR/agents"
 
