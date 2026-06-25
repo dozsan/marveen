@@ -32,9 +32,11 @@ INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 if [ -f "$INSTALL_DIR/.env" ]; then
   SLUG="$(grep -E '^MAIN_AGENT_ID=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
   BOT_NAME="$(grep -E '^BOT_NAME=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
+  CHANNEL_PROVIDER="$(grep -E '^CHANNEL_PROVIDER=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
 fi
 SLUG="${SLUG:-marveen}"
 BOT_NAME="${BOT_NAME:-Marveen}"
+CHANNEL_PROVIDER="${CHANNEL_PROVIDER:-telegram}"
 
 # Root VPS / container: claude refuses --dangerously-skip-permissions as uid 0;
 # the dashboard and the tmux sessions it spawns hit the same wall, so export the
@@ -51,10 +53,13 @@ TIMERS=("${SLUG}-morning.timer")
 # Optional guard timers -- restarted only when actually installed on the host.
 OPTIONAL_TIMERS=("channel-watchdog.timer" "disk-space-guard.timer" "stuck-modal-guard.timer")
 # Non-systemd fallback: pidfile-backed processes (see start.sh / stop.sh).
-# NOTE (Doki, cards f1fc9501 / 8f1886d3): the stuck-channel / stale-provider
-# recovery and the pid-process teardown live in restart_pidfile() +
-# post_restart_channel_check() below -- fill those hooks in there.
 PID_PROCS=("dashboard" "channels")
+# Channel pollers (card f1fc9501): pid-file-backed processes that can hold a
+# wedged inbound connection regardless of systemd -- the plugin's own poller and
+# the standalone channel-coordinator. Tearing these down frees a stuck channel.
+CHANNEL_DIR="$HOME/.claude/channels/${CHANNEL_PROVIDER}"
+BOT_PIDFILE="${CHANNEL_DIR}/bot.pid"
+COORD_PIDFILE="$HOME/.claude/channels/${CHANNEL_PROVIDER}-coordinator/coordinator.pid"
 
 DRY_RUN=0
 LIST_ONLY=0
@@ -87,6 +92,9 @@ print_inventory() {
   for u in "${OPTIONAL_TIMERS[@]}"; do echo "    - ${u}"; done
   echo "  pidfile fallback processes (non-systemd hosts):"
   for p in "${PID_PROCS[@]}"; do echo "    - store/${p}.pid"; done
+  echo "  channel pollers (pid-file, freed on a channels restart):"
+  echo "    - ${BOT_PIDFILE}"
+  echo "    - ${COORD_PIDFILE}"
 }
 
 # ── systemd path (card b3834765) ─────────────────────────────────────────────
@@ -155,39 +163,75 @@ restart_via_systemd() {
   return $rc
 }
 
+# ── pid-process teardown (card f1fc9501) ─────────────────────────────────────
+# stop_pidfile FILE LABEL -- stop a pidfile-backed process the reliable way:
+# SIGTERM, wait for it to exit, escalate to SIGKILL, then remove the (now stale)
+# pidfile. Safe when the file is missing, the pid is malformed, or the process
+# is already dead. Honors --dry-run.
+stop_pidfile() {
+  local pidfile="$1" label="$2" pid
+  [ -f "$pidfile" ] || return 0
+  pid="$(cat "$pidfile" 2>/dev/null)"
+  if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+    [ "$DRY_RUN" = "1" ] && { echo "  - ${label}: stale pidfile (no valid pid)"; return 0; }
+    rm -f "$pidfile"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "  - ${label} (pid ${pid}): would stop (dry-run)"
+    return 0
+  fi
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 5 ]; do
+      sleep 0.5
+      waited=$((waited + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+      echo "  ✓ ${label} (pid ${pid}): killed (did not exit on TERM)"
+    else
+      echo "  ✓ ${label} (pid ${pid}): stopped"
+    fi
+  else
+    echo "  - ${label}: not running (stale pidfile)"
+  fi
+  rm -f "$pidfile"
+}
+
+# release_channel_pollers -- stop the pid-file-backed channel processes that can
+# pin a wedged inbound connection: the plugin's own poller (bot.pid) and the
+# standalone channel-coordinator (coordinator.pid). Freeing these is what lets a
+# stuck channel (e.g. a poller stranded on a stale provider after a
+# Discord -> Telegram switch) recover when the channels session relaunches.
+release_channel_pollers() {
+  echo "${BOT_NAME}: releasing channel pollers (provider=${CHANNEL_PROVIDER})..."
+  stop_pidfile "$BOT_PIDFILE" "channel poller (bot.pid)"
+  stop_pidfile "$COORD_PIDFILE" "channel-coordinator"
+}
+
 # ── non-systemd fallback (pidfile path) ──────────────────────────────────────
-# Basic stop + start for hosts without systemd --user (WSL, containers),
-# mirroring start.sh / stop.sh. Doki (f1fc9501): the stuck-channel-aware
-# teardown of pid-backed processes belongs in this function.
+# Stop + start for hosts without systemd --user (WSL, containers), mirroring
+# start.sh / stop.sh, with the stuck-channel-aware poller teardown of f1fc9501.
 restart_pidfile() {
   echo "${BOT_NAME}: systemd --user unavailable, restarting via pidfiles..."
   for svc in "${PID_PROCS[@]}"; do
-    local pidfile="$INSTALL_DIR/store/${svc}.pid"
-    if [ -f "$pidfile" ]; then
-      local pid
-      pid="$(cat "$pidfile" 2>/dev/null)"
-      if [ "$DRY_RUN" = "1" ]; then
-        echo "  - ${svc} (pid ${pid:-?}): would stop (dry-run)"
-      else
-        kill "$pid" 2>/dev/null || true
-        rm -f "$pidfile"
-        echo "  - ${svc}: stopped"
-      fi
-    fi
+    stop_pidfile "$INSTALL_DIR/store/${svc}.pid" "$svc"
   done
-  # The channels tmux session must go down too, so the relaunch binds the
-  # current channel provider instead of a stale one.
+  # Free the wedged channel pollers, then drop the channels tmux session so the
+  # relaunch binds the current provider instead of a stale one.
+  release_channel_pollers
   if [ "$DRY_RUN" != "1" ]; then
     tmux kill-session -t "${SLUG}-channels" 2>/dev/null || true
-    # Bring services back up via the canonical launcher.
-    bash "$INSTALL_DIR/scripts/start.sh"
+    bash "$INSTALL_DIR/scripts/start.sh"   # canonical relaunch
   else
-    echo "  - would run scripts/start.sh to relaunch"
+    echo "  - would kill tmux session ${SLUG}-channels and run scripts/start.sh"
   fi
   post_restart_channel_check || true
 }
 
-# ── Doki hook (cards f1fc9501 / 8f1886d3) ────────────────────────────────────
+# ── channel rebind verification hook (card 8f1886d3, Doki) ───────────────────
 # Verify the freshly restarted channels session bound the CURRENT provider
 # (e.g. Telegram) and is not stuck on a stale Discord connection. No-op for now;
 # Doki fills this in.
