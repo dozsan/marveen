@@ -1,0 +1,46 @@
+# Marveen -- containerized runtime, host-side code + state.
+#
+# The image is a thin runtime (see Dockerfile). Marveen's code and state live on
+# the host and are bind-mounted at /app, so you update on the host and restart
+# the container -- no rebuild. Only node_modules is a container-side named volume
+# (native binding must match the image's Node/glibc).
+#
+# Quick start:
+#   1. Put the Marveen repo on the host (this dir works, or set MARVEEN_HOST_DIR).
+#   2. Create .env on the host (cp .env.example .env) with your channel token.
+#   3. Drop the OAuth setup-token into store/.claude-oauth-token (0600).
+#      Generate it anywhere with a browser:  claude setup-token
+#   4. docker compose up -d --build
+#   5. Dashboard: http://localhost:${MARVEEN_PORT:-3420}
+#
+# Updating Marveen later (from the host, no rebuild):
+#   git -C "$MARVEEN_HOST_DIR" pull   # then:
+#   docker compose restart            # entrypoint rebuilds deps/dist if needed
+
+services:
+  marveen:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: marveen-runtime:latest
+    # proper PID 1 signal handling / zombie reaping for the tmux + node tree
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${MARVEEN_PORT:-3420}:3420"
+    environment:
+      # HOME holds the ~/.claude "dotcloud"; kept under the (gitignored) store/
+      # tree so it persists on the host bind mount alongside the rest of state.
+      HOME: /app/store/home
+      WEB_PORT: "3420"
+      IS_SANDBOX: "1"
+      TZ: "${TZ:-Europe/Budapest}"
+    volumes:
+      # Code + state from the host (updatable): store/, agents/, .env, dotcloud.
+      - "${MARVEEN_HOST_DIR:-.}:/app"
+      # node_modules is CONTAINER-built (native better-sqlite3). Never bind the
+      # host's node_modules here -- it would shadow this and break the binding.
+      - marveen_node_modules:/app/node_modules
+
+volumes:
+  marveen_node_modules:

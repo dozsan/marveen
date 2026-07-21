@@ -1,0 +1,10 @@
+# The image bakes in NO source (code arrives via the /app bind mount at runtime),
+# so the build context only needs the Dockerfile + entrypoint. Keep it minimal --
+# these are the heavy/host-specific paths that must never enter a build.
+node_modules
+dist
+store
+.git
+.env
+*.log
+.DS_Store
