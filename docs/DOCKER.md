@@ -24,6 +24,22 @@ This is the deliberate design from the discussion:
 | `docker-compose.yml` | Bind mount `/app`, `node_modules` volume, published port. |
 | `.dockerignore` | Keeps the build context tiny (no source needed at build). |
 
+## Make targets
+
+A `Makefile` wraps the common flows -- run `make help` for the full list. The
+essentials:
+
+```bash
+make install   # first-time setup from scratch (seed .env, check token, build + start)
+make up        # start (already installed)
+make update    # git pull + rebuild + restart
+make logs      # follow logs
+make health    # is the dashboard up?
+make down      # stop (host state is kept)
+```
+
+The manual `docker compose` flow below is equivalent, if you prefer it.
+
 ## Quick start
 
 ```bash
